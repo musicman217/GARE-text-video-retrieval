@@ -201,7 +201,7 @@ class GARE(nn.Module):
         a, b = cls.size(0), video_feat.size(0)
 
         _cls = cls.unsqueeze(1).repeat(1,b,1) # (a,b,dim)
-        delta = video_feat_mean - _cls
+        delta = video_feat_mean - _cls.detach() # since learning rate for text encoder and psi module 1e-7 and 1e-4 respectively, detach() op can also be removed.
         delta, _ = self.psi(delta.unsqueeze(0), v_feat.unsqueeze(0)) #
         delta = delta.squeeze(0)
         cls = _cls + delta # (a,b,dim)
