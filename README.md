@@ -71,3 +71,16 @@ main_retrieval.py \
 ## 🎗️ Acknowledgments
 * This code implementation are adopted from [CLIP](https://github.com/openai/CLIP), [DRL](https://github.com/foolwood/DRL), and [EMCL](https://github.com/jpthu17/EMCL).
 We sincerely appreciate for their contributions.
+
+## 📝 Citation
+If you find this code useful for your research, please consider citing our paper:
+
+```bibtex
+@article{xiao2026rebalancing,
+  title={Rebalancing Contrastive Alignment with Bottlenecked Semantic Increments in Text-Video Retrieval},
+  author={Xiao, Jian and Song, Zijie and Hu, Jialong and Cheng, Hao and Hu, Zhenzhen and Li, Jia and Hong, Richang},
+  journal={Advances in Neural Information Processing Systems},
+  volume={38},
+  pages={2985--3018},
+  year={2026}
+}
