@@ -35,7 +35,7 @@ class MultiHeadedCrossAttn(nn.Module):
 
         _, f, _, _ = context_embeds.shape
         video_embeds = context_embeds.permute(0,2,1,3) # (t,b,f,d)
-        k = self.k_proj(context_embeds)
+        k = self.k_proj(video_embeds)
         k = k.reshape(t, b, f, self.num_heads, self.head_dim)
         k = k.permute(0,1,3,2,4) # (t,b,h,f,hd)
 
