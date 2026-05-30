@@ -75,8 +75,8 @@ def get_args(description='Rebalancing Contrastive Alignment with Bottlenecked Se
     
     # --------------
     # for gare
-    parser.add_argument("--alpha", type=float, default=2, help="for direction diversity loss")
-    parser.add_argument("--beta", type=float, default=0.07, help="weight of relaxed VIB compression term")
+    parser.add_argument("--alpha", type=float, default=2.0, help="for direction diversity loss")
+    parser.add_argument("--beta", type=float, default=1e-4, help="weight of relaxed VIB compression term")
     parser.add_argument("--lambda_dir", type=float, default=0.01, help="weight of direction diversity loss")
     parser.add_argument("--lambda_epsilon", type=float, default=0.01, help="weight of norm-based regularization of trust-region radii loss")
     parser.add_argument("--lambda_lower", type=float, default=0.5, help="truncated lower bound for regularization of trust-region radii")
