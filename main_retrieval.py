@@ -3,7 +3,6 @@ from __future__ import division
 from __future__ import unicode_literals
 from __future__ import print_function
 
-import json
 import os
 import time
 import random
@@ -25,6 +24,7 @@ from tvr.utils.metrics import compute_metrics, tensor_text_to_video_metrics, ten
 from tvr.utils.comm import is_main_process, synchronize
 from tvr.utils.logger import setup_logger
 from tvr.utils.metric_logger import MetricLogger
+
 
 allgather = AllGather.apply
 
@@ -72,7 +72,7 @@ def get_args(description='Rebalancing Contrastive Alignment with Bottlenecked Se
     
     parser.add_argument('--temp', type=float, default=5)
     parser.add_argument('--center', type=int, default=8)
-
+    
     # --------------
     # for gare
     parser.add_argument("--alpha", type=float, default=2, help="for direction diversity loss")
@@ -82,6 +82,7 @@ def get_args(description='Rebalancing Contrastive Alignment with Bottlenecked Se
     parser.add_argument("--lambda_lower", type=float, default=0.5, help="truncated lower bound for regularization of trust-region radii")
     # --------------
 
+    
     parser.add_argument("--init_model", default=None, type=str, required=False, help="Initial model.")
 
     args = parser.parse_args()
@@ -188,9 +189,9 @@ def build_dataloader(args):
 def prep_optimizer(args, model, num_train_optimization_steps, local_rank):
     if hasattr(model, 'module'):
         model = model.module
-    lr = args.lr  # 0.0001
-    coef_lr = args.coef_lr  # 0.001
-    weight_decay = args.weight_decay  # 0.2
+    lr = args.lr
+    coef_lr = args.coef_lr
+    weight_decay = args.weight_decay
     warmup_proportion = args.warmup_proportion
     param_optimizer = list(model.named_parameters())
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
@@ -248,7 +249,6 @@ def reduce_loss(loss, args):
     return loss
 
 
-
 def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer,
                 scheduler, global_step, max_steps, val_dataloader):
     global logger
@@ -259,9 +259,10 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer,
     model.train()
     log_step = args.n_display
     total_loss = 0
-    GARE(args)
-    
+    old_policy = GARE(args)
+
     end = time.time()
+    logit_scale = 0
     for step, batch in enumerate(train_dataloader, start=1):
         global_step += 1
         data_time = time.time() - end
@@ -271,18 +272,17 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer,
             batch = tuple(t.to(device=device, non_blocking=True) for t in batch)
 
         text_ids, text_mask, video, video_mask, inds, idx = batch
-        loss, contrastive_loss, reg_loss = model(text_ids, text_mask, video, video_mask, idx, global_step)
-        
-        if n_gpu > 1:
-            # print(loss.shape)
-            loss = loss.mean()  # mean() to average on multi-gpu.
-            contrastive_loss = contrastive_loss.mean()
-            reg_loss = reg_loss.mean()
 
+        loss, uniformity_loss, alignment_loss = model(text_ids, text_mask, video, video_mask, idx, global_step, old_policy)
+
+        if n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu.
+            uniformity_loss = uniformity_loss.mean()
+            alignment_loss = alignment_loss.mean()
 
         # with torch.autograd.detect_anomaly():
         loss.backward()
-            
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
         optimizer.step()
@@ -304,10 +304,10 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer,
         end = time.time()
 
         reduced_l = reduce_loss(loss, args)
-        reduced_contrastive_loss = reduce_loss(contrastive_loss, args)
-        reduced_reg_loss = reduce_loss(reg_loss, args)
+        reduced_uniformity_loss = reduce_loss(uniformity_loss, args)
+        reduced_alignment_loss = reduce_loss(alignment_loss, args)
         meters.update(time=batch_time, data=data_time, loss=float(reduced_l),
-                      E_loss=float(reduced_contrastive_loss), M_loss=float(reduced_reg_loss))
+                      E_loss=float(reduced_uniformity_loss), M_loss=float(reduced_alignment_loss))
 
         eta_seconds = meters.time.global_avg * (max_steps - global_step)
         eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
@@ -336,6 +336,8 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer,
                     memory=torch.cuda.max_memory_allocated() / 1024.0 / 1024.0,
                 )
             )
+
+
         if global_step % (log_step * 3) == 0 or global_step == 1:
             R1 = eval_epoch(args, model, val_dataloader, args.device)
             if args.local_rank == 0:
@@ -349,7 +351,34 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer,
     return total_loss, global_step
 
 
-def _run_on_single_gpu(args, model, t_mask_list, v_mask_list, t_feat_list, v_feat_list, cls_list,mini_batch=16):
+def _run_on_single_gpu(args, model, t_mask_list, v_mask_list, t_feat_list, v_feat_list, cls_list,
+                       train_t_mask_list, train_v_mask_list, train_t_feat_list, train_v_feat_list,
+                       train_cls_list, mini_batch=16):
+    # Returns list of retrieved top k videos based on the sims matrix
+    def get_retrieved_videos(sims, k, theta):
+        argm = np.argsort(-sims, axis=1)
+        topk = argm[:,:k].reshape(-1)
+        retrieved_videos, occurrence_count = np.unique(topk, return_counts=True)
+        return retrieved_videos[occurrence_count>=theta]
+
+    # Returns list of indices to normalize from sims based on videos
+    def get_index_to_normalize(sims, videos):
+        argm = np.argsort(-sims, axis=1)[:,0]
+        result = np.array(list(map(lambda x: x in videos, argm)))
+        result = np.nonzero(result)
+        return result
+
+    def qb_norm(train_test, test_test, k, beta, theta):
+        retrieved_videos = get_retrieved_videos(train_test, k, theta)
+        test_test_normalized = test_test
+        train_test = np.exp(train_test*beta)
+        test_test = np.exp(test_test*beta)
+
+        normalizing_sum = np.sum(train_test, axis=0)
+        index_for_normalizing = get_index_to_normalize(test_test, retrieved_videos)
+        test_test_normalized[index_for_normalizing, :] = \
+            np.divide(test_test[index_for_normalizing, :], normalizing_sum)
+        return test_test_normalized
     
     sim_matrix = []
     logger.info('[finish] map to main gpu')
@@ -359,27 +388,46 @@ def _run_on_single_gpu(args, model, t_mask_list, v_mask_list, t_feat_list, v_fea
     batch_t_feat = torch.split(t_feat_list, mini_batch)
     batch_v_feat = torch.split(v_feat_list, mini_batch)
     batch_cls_feat = torch.split(cls_list, mini_batch)
-
+    
+    train_batch_t_mask = torch.split(train_t_mask_list, mini_batch)
+    train_batch_v_mask = torch.split(train_v_mask_list, mini_batch)
+    train_batch_t_feat = torch.split(train_t_feat_list, mini_batch)
+    train_batch_v_feat = torch.split(train_v_feat_list, mini_batch)
+    train_batch_cls_feat = torch.split(train_cls_list, mini_batch)
 
     logger.info('[finish] map to main gpu')
+    t_new, delt, v_pool = [], [], []
     with torch.no_grad():        
         for idx1, (t_mask, t_feat, cls) in enumerate(zip(batch_t_mask, batch_t_feat, batch_cls_feat)):
             each_row = []
+            t_new_row, delt_row, v_pool_row = [],[],[]
             for idx2, (v_mask, v_feat) in enumerate(zip(batch_v_mask, batch_v_feat)):
-                logits, *_tmp = model.get_similarity_logits(t_feat, cls, v_feat, t_mask, v_mask)
+                logits, logits_t, a_loss, cls_new, delta, v_pooled = model.get_similarity_logits(t_feat, cls, v_feat, t_mask, v_mask)
                 each_row.append(logits.cpu().detach().numpy())
+                t_new_row.append(cls_new.cpu().detach().numpy())
+                delt_row.append(delta.cpu().detach().numpy())
+                v_pool_row.append(v_pooled.cpu().detach().numpy())
             each_row = np.concatenate(tuple(each_row), axis=-1)
+            t_new_row = np.concatenate(tuple(t_new_row), axis=1)
+            delt_row = np.concatenate(tuple(delt_row), axis=1)
+            v_pool_row = np.concatenate(tuple(v_pool_row), axis=1)
             sim_matrix.append(each_row)
+            t_new.append(t_new_row)
+            delt.append(delt_row)
+            v_pool.append(v_pool_row)
             
     sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
-
+    t_new = np.concatenate(tuple(t_new), axis=0)
+    delt = np.concatenate(tuple(delt), axis=0)
+    v_pool = np.concatenate(tuple(v_pool), axis=0)
     
-    return sim_matrix
+    return sim_matrix, t_new, delt, v_pool
 
 
 def eval_epoch(args, model, test_dataloader, device):
     global train_dataloader0
     global train_sampler0
+    global best_score
     
     if hasattr(model, 'module'):
         model = model.module.to(device)
@@ -413,9 +461,33 @@ def eval_epoch(args, model, test_dataloader, device):
     # ----------------------------
     batch_mask_t, batch_mask_v, batch_feat_t, batch_feat_v, ids_t, ids_v = [], [], [], [], [], []
     batch_cls = []
+    tran_cls, train_t, train_v, train_mask_t, train_mask_v = [], [], [], [], []
 
-
+    batch_mask_train_t, batch_mask_train_v, batch_feat_train_t, batch_feat_train_v, ids_train_t, ids_train_v = [], [], [], [], [], []
+    batch_train_cls = []
+    
     with torch.no_grad():
+        logger.info('[start] extract train feature')
+        for bid, batch in enumerate(train_dataloader0):
+            batch = tuple(t.to(device) for t in batch)
+            text_ids, text_mask, video, video_mask, inds, _ = batch
+            video_mask = video_mask.view(-1, video_mask.shape[-1])
+            text_feat, video_feat, cls = model.get_text_video_feat(text_ids, text_mask, video, video_mask)
+            ids_train_t.append(inds)
+            batch_mask_train_t.append(text_mask)
+            batch_mask_train_v.append(video_mask)
+            batch_feat_train_t.append(text_feat)
+            batch_feat_train_v.append(video_feat)
+            batch_train_cls.append(cls)
+            print("{}/{}\r".format(bid, len(train_dataloader0)), end="")
+
+        ids_train_t = allgather(torch.cat(ids_train_t, dim=0), args).squeeze()
+        batch_mask_train_t = allgather(torch.cat(batch_mask_train_t, dim=0), args)
+        batch_mask_train_v = allgather(torch.cat(batch_mask_train_v, dim=0), args)
+        batch_feat_train_t = allgather(torch.cat(batch_feat_train_t, dim=0), args)
+        batch_feat_train_v = allgather(torch.cat(batch_feat_train_v, dim=0), args)
+        batch_train_cls = allgather(torch.cat(batch_train_cls, dim=0), args)
+        logger.info('[finish] extract train feature')
                 
         tic = time.time()
         if multi_sentence_:  # multi-sentences retrieval means: one clip has two or more descriptions.
@@ -459,10 +531,9 @@ def eval_epoch(args, model, test_dataloader, device):
             logger.info('[start] extract text+video feature')
             for batch in tqdm(test_dataloader):
                 batch = tuple(t.to(device) for t in batch)
-                text_ids, text_mask, video, video_mask, inds, vid = batch
+                text_ids, text_mask, video, video_mask, inds, _ = batch
                 text_feat, video_feat, cls = model.get_text_video_feat(text_ids, text_mask, video, video_mask)
                 ids_t.append(inds)
-                ids_v.append(vid)
                 batch_mask_t.append(text_mask)
                 batch_mask_v.append(video_mask)
                 batch_feat_t.append(text_feat)
@@ -474,7 +545,7 @@ def eval_epoch(args, model, test_dataloader, device):
             batch_feat_t = allgather(torch.cat(batch_feat_t, dim=0), args)
             batch_feat_v = allgather(torch.cat(batch_feat_v, dim=0), args)
             batch_cls = allgather(torch.cat(batch_cls, dim=0), args)
-            batch_mask_t[ids_t] = batch_mask_t.clone()
+            batch_mask_t[ids_t] = batch_mask_t.clone() # reranking, according to ids
             batch_mask_v[ids_t] = batch_mask_v.clone()
             batch_feat_t[ids_t] = batch_feat_t.clone()
             batch_feat_v[ids_t] = batch_feat_v.clone()
@@ -486,48 +557,48 @@ def eval_epoch(args, model, test_dataloader, device):
             batch_cls = batch_cls[:ids_t.max() + 1, ...]
             logger.info('[finish] extract text+video feature')
 
-
     toc1 = time.time()
+
     logger.info('{} {} {} {}'.format(len(batch_mask_t), len(batch_mask_v), len(batch_feat_t), len(batch_feat_v)))
     # ----------------------------------
     # 2. calculate the similarity
     # ----------------------------------
     logger.info('[start] calculate the similarity')
     with torch.no_grad():
-        sim_matrix0 = _run_on_single_gpu(args, model, batch_mask_t, batch_mask_v, batch_feat_t, batch_feat_v, batch_cls)
+        sim_matrix0, t_new,delta,v_pool  = _run_on_single_gpu(args, model, batch_mask_t, batch_mask_v, batch_feat_t, batch_feat_v, batch_cls, batch_mask_train_t, batch_mask_train_v, batch_feat_train_t, batch_feat_train_v, batch_train_cls)
     logger.info('[end] calculate the similarity')
 
     toc2 = time.time()
     logger.info('[start] compute_metrics')
-    if multi_sentence_:  
-        logger.info("before reshape, sim matrix size: {} x {}".format(sim_matrix0.shape[0], sim_matrix0.shape[1]))
-        cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
-        max_length = max([e_ - s_ for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_)])
-        t2v_sim_matrix_new = []
-        for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
-            t2v_sim_matrix_new.append(np.concatenate((sim_matrix0[s_:e_],
-                                                  np.full((max_length - e_ + s_, sim_matrix0.shape[1]), -np.inf)),
-                                                 axis=0))
-        t2v_sim_matrix_new = np.stack(tuple(t2v_sim_matrix_new), axis=0)
-
-        v2t_sim_matrix = sim_matrix0.T
-        v2t_sim_matrix_new = []
-        for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
-            v2t_sim_matrix_new.append(np.concatenate((v2t_sim_matrix[s_:e_],
-                                                  np.full((max_length - e_ + s_, v2t_sim_matrix.shape[1]), -np.inf)),
-                                                 axis=0))
-        v2t_sim_matrix_new = np.stack(tuple(v2t_sim_matrix_new), axis=0)
-
-        logger.info("after reshape, sim matrix size: {} x {} x {}".
-                    format(t2v_sim_matrix_new.shape[0], t2v_sim_matrix_new.shape[1], t2v_sim_matrix_new.shape[2]))
-
-        tv_metrics = compute_metrics(t2v_sim_matrix_new)
-        vt_metrics = compute_metrics(v2t_sim_matrix_new.T)
-    else:
-        logger.info("sim matrix size: {}, {}".format(sim_matrix0.shape[0], sim_matrix0.shape[1]))
-        tv_metrics = compute_metrics(sim_matrix0)
-        vt_metrics = compute_metrics(sim_matrix0.T)
-        logger.info('\t Length-T: {}, Length-V:{}'.format(len(sim_matrix0), len(sim_matrix0[0])))
+    # if multi_sentence_:
+    #     logger.info("before reshape, sim matrix size: {} x {}".format(t2v_sim_matrix.shape[0], t2v_sim_matrix.shape[1]))
+    #     cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
+    #     max_length = max([e_ - s_ for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_)])
+    #     t2v_sim_matrix_new = []
+    #     for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
+    #         t2v_sim_matrix_new.append(np.concatenate((t2v_sim_matrix[s_:e_],
+    #                                               np.full((max_length - e_ + s_, t2v_sim_matrix.shape[1]), -np.inf)),
+    #                                              axis=0))
+    #     t2v_sim_matrix_new = np.stack(tuple(t2v_sim_matrix_new), axis=0)
+    #
+    #     v2t_sim_matrix = v2t_sim_matrix.T
+    #     v2t_sim_matrix_new = []
+    #     for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
+    #         v2t_sim_matrix_new.append(np.concatenate((v2t_sim_matrix[s_:e_],
+    #                                               np.full((max_length - e_ + s_, v2t_sim_matrix.shape[1]), -np.inf)),
+    #                                              axis=0))
+    #     v2t_sim_matrix_new = np.stack(tuple(v2t_sim_matrix_new), axis=0)
+    #
+    #     logger.info("after reshape, sim matrix size: {} x {} x {}".
+    #                 format(t2v_sim_matrix_new.shape[0], t2v_sim_matrix_new.shape[1], t2v_sim_matrix_new.shape[2]))
+    #
+    #     tv_metrics = compute_metrics(t2v_sim_matrix_new)
+    #     vt_metrics = compute_metrics(v2t_sim_matrix_new.T)
+    # else:
+    logger.info("sim matrix size: {}, {}".format(sim_matrix0.shape[0], sim_matrix0.shape[1]))
+    tv_metrics = compute_metrics(sim_matrix0)
+    vt_metrics = compute_metrics(sim_matrix0.T)
+    logger.info('\t Length-T: {}, Length-V:{}'.format(len(sim_matrix0), len(sim_matrix0[0])))
 
     logger.info('[end] compute_metrics')
 
@@ -538,6 +609,7 @@ def eval_epoch(args, model, test_dataloader, device):
                 format(tv_metrics['R1'], tv_metrics['R5'], tv_metrics['R10'], tv_metrics['R50'], tv_metrics['MR'], tv_metrics['MeanR']))
     logger.info("Video-to-Text: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@50: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}".
                 format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['R50'], vt_metrics['MR'], vt_metrics['MeanR']))
+
 
     return tv_metrics['R1']
 
@@ -551,6 +623,8 @@ def main():
 
     meters = MetricLogger(delimiter="  ")
     args = get_args()
+
+
     if not exists(args.output_dir):
         os.makedirs(args.output_dir, exist_ok=True)
     logger = setup_logger('tvr', args.output_dir, args.local_rank)
@@ -584,6 +658,7 @@ def main():
             torch.cuda.empty_cache()
             synchronize()
 
+
             if args.local_rank == 0:
                 output_model_file = save_model(epoch, args, model, type_name="")
 
@@ -612,6 +687,7 @@ def main():
 
     elif args.do_eval:
         eval_epoch(args, model, test_dataloader, args.device)
+
 
 
 if __name__ == "__main__":
