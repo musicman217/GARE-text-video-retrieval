@@ -8,20 +8,14 @@ import torch.nn.functional as F
 from .module_clip import CLIP, convert_weights, _PT_NAME
 from .module_cross import CrossModel, Transformer as TransformerClip
 from .until_module import LayerNorm, AllGather, AllGather2, CrossEn, MSE, ArcCrossEn, KL
-from .psi_module import Agent
 import numpy as np
+from .psi_module import Agent
 from torch.distributions import Normal, kl_divergence, Independent
 
 
 allgather = AllGather.apply
 allgather2 = AllGather2.apply
 
-
-def check_nan_inf(tensor, name):
-    if torch.isnan(tensor).any():
-        print(f"NaN detected in {name}")
-    if torch.isinf(tensor).any():
-        print(f"Inf detected in {name}")
 
 class ResidualLinear(nn.Module):
     def __init__(self, d_int: int):
@@ -91,18 +85,15 @@ class GARE(nn.Module):
         cross_config.hidden_size = transformer_width
         self.cross_config = cross_config
 
-        # -------------------------------------
-        # psi module, to predict increments Delta, also can be seen as Dirac delta function
-        # implemented as a pair-wise parallelization cross-attention Transformer module
+
         self.agent = Agent()
         self.psi = self.agent.psi
-        # -------------------------------------
-
-
         width = int(transformer_width // self.config.center)
         self.weight_fc = nn.Sequential(
             nn.Linear(2 * width, 4 * width), nn.ReLU(inplace=True),
             nn.Linear(4 * width, 1))
+
+
         if self.agg_module in ["seqLSTM", "seqTransf"]:
             self.frame_position_embeddings = nn.Embedding(cross_config.max_position_embeddings,
                                                           cross_config.hidden_size)
@@ -178,31 +169,31 @@ class GARE(nn.Module):
             logit_scale = self.clip.logit_scale.exp()
             loss = 0.
 
-            M_t2v_logits, M_v2t_logits, reg_loss = self.get_similarity_logits(text_feat, cls, video_feat,
-                                                                    text_mask, video_mask, global_step=global_step, shaped=True)
+            M_t2v_logits, M_v2t_logits, a_loss, gamma_row, gamma_column = self.get_similarity_logits(text_feat, cls, video_feat,
+                                                                    text_mask, video_mask, global_step=global_step, shaped=True, old_policy=old_policy)
             
             M_loss_t2v = self.loss_fct(M_t2v_logits * logit_scale)
             M_loss_v2t = self.loss_fct(M_v2t_logits * logit_scale)
             M_loss = (M_loss_t2v + M_loss_v2t) / 2
             
-            loss = M_loss + reg_loss
-            return loss, M_loss, reg_loss
+            loss = M_loss + a_loss
+            return loss, M_loss, a_loss
         else:
             return None
 
-    def similarity(self, text_feat, cls, video_feat, text_mask, video_mask, global_step):
-        v_feat = video_feat # (b,v,dim)
+    def similarity(self, text_feat, cls, video_feat, text_mask, video_mask, global_step, old_policy):
+        v_feat = video_feat # (b,v,d)
         v_weight = torch.einsum('ad,bvd->abv', [cls, video_feat])
         v_weight = torch.softmax(v_weight / self.config.temp, dim=-1)
         v_weight = torch.einsum('abv,bv->abv', [v_weight, video_mask])
         video_feat_pooled = torch.einsum('abv,bvd->abd', [v_weight, video_feat])
-        video_feat_mean = v_feat.mean(1).unsqueeze(0) # ->(1,b,dim)
-
+        video_feat_mean = v_feat.mean(1).unsqueeze(0)
         a, b = cls.size(0), video_feat.size(0)
 
-        _cls = cls.unsqueeze(1).repeat(1,b,1) # (a,b,dim)
+        _cls = cls.unsqueeze(1).repeat(1,b,1)
+
         delta = video_feat_mean - _cls.detach() # since learning rate for text encoder and psi module are 1e-7 and 1e-4 respectively, detach() op can also be removed.
-        delta, _ = self.psi(delta.unsqueeze(0), v_feat.unsqueeze(0)) #
+        delta, log_sigma = self.psi(delta.unsqueeze(0), v_feat.unsqueeze(0))
         delta = delta.squeeze(0)
         cls = _cls + delta # (a,b,dim)
 
@@ -214,7 +205,9 @@ class GARE(nn.Module):
         _v_feat = v_feat / v_feat.norm(dim=-1, keepdim=True)
         retrieve_logits = torch.einsum('abd,abd->ab', [_t_feat, _v_feat])
 
-        reg_loss = 0.0
+        kl_loss = 0.0
+        gamma_row = None
+        gamma_column = None
         if self.training:
             # ---------------------------------------------------------------------------
             # Relaxation of Variational Information Bottleneck Compression Term
@@ -223,49 +216,49 @@ class GARE(nn.Module):
             # thus avoid the KL divergence to be infinite
             mu = delta.mean(dim=0)
             sigma = delta.std(dim=0) + 1e-6
-            target_dist = Normal(torch.zeros_like(mu), torch.ones_like(sigma))
-            estimated_dist = Normal(mu, sigma)
+            target_dist = Independent(Normal(torch.zeros_like(mu), torch.ones_like(sigma)), 1)
+            estimated_dist = Independent(Normal(mu, sigma), 1)
             kl_div = kl_divergence(estimated_dist, target_dist).mean()
-            beta = self.config.beta
-            relaxed_vib_loss = beta * kl_div
+            lamba = 1e-4
+            kl_loss = lamba * kl_div
             # ---------------------------------------------------------------------------
 
 
-            lambda_dir, lambda_epsilon = self.config.lambda_dir, self.config.lambda_epsilon
-            dir_loss = self.direction_diversity_loss(delta, alpha=self.config.alpha)
-            norm_loss = self.norm_based_epsilon_regularization_loss(delta, lambda_lower=self.config.lambda_lower) # hard margin 49.1
+            lambda_dir, lambda_rad = 0.01, 0.01
+            dir_loss = self.direction_diversity_loss(delta)
+            rad_loss = self.norm_based_epsilon_regularization_loss(delta) # hard margin 49.1
 
-            t_anchor_reg_loss = lambda_dir * dir_loss + lambda_epsilon * norm_loss
-            reg_loss = relaxed_vib_loss +t_anchor_reg_loss
+
+            t_anchor_reg_loss = lambda_dir * dir_loss + lambda_rad * rad_loss
+            kl_loss += t_anchor_reg_loss
             if self.config.local_rank==0 and global_step%50==0:
-                print(f't dir loss: {lambda_dir * dir_loss}, t rad loss: {lambda_epsilon * norm_loss}')
-                print(f'kl loss: {relaxed_vib_loss}')
+                print(f't dir loss: {lambda_dir * dir_loss}, t rad loss: {lambda_rad * rad_loss}')
+                print(f'kl loss: {lamba * kl_div}')
+
+        return retrieve_logits, retrieve_logits.T, kl_loss, cls, delta, video_feat_pooled, gamma_row, gamma_column
 
 
-        return retrieve_logits, retrieve_logits.T, reg_loss
-
-
-    # Direction Diversity Regularization for Text Anchors
-    def direction_diversity_loss(self, delta, alpha=1):
+    def direction_diversity_loss(self, delta, t=2.0):
         B_t, B_v, D = delta.shape
-        delta_dir = F.normalize(delta, dim=2)  # [B_t, B_v, D]
+        delta_dir = F.normalize(delta, dim=2)
 
         loss = 0.0
+
         for i in range(B_t):
             z = delta_dir[i]
             sim = torch.matmul(z, z.T)
             dist = 1 - sim
-            loss += torch.log(torch.exp(-alpha * dist).mean() + 1e-8)
+            loss += torch.log(torch.exp(-t * dist).mean() + 1e-8)
 
         return loss / B_t
 
-    # Norm-Based Regularization of Trust-Region Radii for Text Anchors
-    def norm_based_epsilon_regularization_loss(self, delta, lambda_lower=1):
+    def norm_based_epsilon_regularization_loss(self, delta):
         B_t, B_v, D = delta.shape
         dist = delta.norm(p=2, dim=2)
         var = dist.var(dim=1)
         loss = -var.mean()
-        return loss  if loss >= -lambda_lower else 0
+        return loss  if loss >= -0.5 else 0
+
 
 
     def get_text_feat(self, text_ids, text_mask, shaped=False):
@@ -290,6 +283,7 @@ class GARE(nn.Module):
             else:
                 b, pair, bs, ts, channel, h, w = video.shape
                 video = video.view(b * pair * bs * ts, channel, h, w)
+
 
         bs_pair, n_v = video_mask.size()
         video_feat = self.clip.encode_image(video, return_hidden=True)[0].float()
@@ -333,7 +327,6 @@ class GARE(nn.Module):
         text_feat = text_feat.unsqueeze(1).contiguous()
         return text_feat
 
-    # TODO: if you try to finetune the model on MSVD, comment this function in `get_video_feat`
     def agg_video_feat(self, video_feat, video_mask, agg_module):
         video_feat = video_feat.contiguous()
         if agg_module == "None":
@@ -366,15 +359,16 @@ class GARE(nn.Module):
         return video_feat
 
 
-    def get_similarity_logits(self, text_feat, cls, video_feat, text_mask, video_mask, global_step=0, shaped=False):
+    def get_similarity_logits(self, text_feat, cls, video_feat, text_mask, video_mask, global_step=0, shaped=False, old_policy=None):
         if shaped is False:
             text_mask = text_mask.view(-1, text_mask.shape[-1])
             video_mask = video_mask.view(-1, video_mask.shape[-1])
 
-        M_t2v_logits, M_v2t_logits, reg_loss= self.similarity(text_feat, cls, video_feat, text_mask, video_mask, global_step)
+        M_t2v_logits, M_v2t_logits, a_loss, cls, delta, v_pooled, gamma_row, gamma_column = self.similarity(text_feat, cls, video_feat, text_mask, video_mask, global_step, old_policy=old_policy)
         
-
-        return M_t2v_logits, M_v2t_logits, reg_loss
+        if self.training:
+            return M_t2v_logits, M_v2t_logits, a_loss, gamma_row, gamma_column
+        return M_t2v_logits, M_v2t_logits, a_loss, cls, delta, v_pooled
 
     @property
     def dtype(self):
