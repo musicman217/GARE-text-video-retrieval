@@ -169,15 +169,15 @@ class GARE(nn.Module):
             logit_scale = self.clip.logit_scale.exp()
             loss = 0.
 
-            M_t2v_logits, M_v2t_logits, a_loss, gamma_row, gamma_column = self.get_similarity_logits(text_feat, cls, video_feat,
+            M_t2v_logits, M_v2t_logits, reg_loss, gamma_row, gamma_column = self.get_similarity_logits(text_feat, cls, video_feat,
                                                                     text_mask, video_mask, global_step=global_step, shaped=True, old_policy=old_policy)
             
             M_loss_t2v = self.loss_fct(M_t2v_logits * logit_scale)
             M_loss_v2t = self.loss_fct(M_v2t_logits * logit_scale)
             M_loss = (M_loss_t2v + M_loss_v2t) / 2
             
-            loss = M_loss + a_loss
-            return loss, M_loss, a_loss
+            loss = M_loss + reg_loss
+            return loss, M_loss, reg_loss
         else:
             return None
 
@@ -192,7 +192,7 @@ class GARE(nn.Module):
 
         _cls = cls.unsqueeze(1).repeat(1,b,1)
 
-        delta = video_feat_mean - _cls.detach() # since learning rate for text encoder and psi module are 1e-7 and 1e-4 respectively, detach() op can also be removed.
+        delta = video_feat_mean - _cls
         delta, log_sigma = self.psi(delta.unsqueeze(0), v_feat.unsqueeze(0))
         delta = delta.squeeze(0)
         cls = _cls + delta # (a,b,dim)
@@ -205,7 +205,7 @@ class GARE(nn.Module):
         _v_feat = v_feat / v_feat.norm(dim=-1, keepdim=True)
         retrieve_logits = torch.einsum('abd,abd->ab', [_t_feat, _v_feat])
 
-        kl_loss = 0.0
+        reg_loss = 0.0
         gamma_row = None
         gamma_column = None
         if self.training:
@@ -219,26 +219,25 @@ class GARE(nn.Module):
             target_dist = Independent(Normal(torch.zeros_like(mu), torch.ones_like(sigma)), 1)
             estimated_dist = Independent(Normal(mu, sigma), 1)
             kl_div = kl_divergence(estimated_dist, target_dist).mean()
-            lamba = 1e-4
-            kl_loss = lamba * kl_div
+            vib_loss = self.config.beta * kl_div
             # ---------------------------------------------------------------------------
 
 
-            lambda_dir, lambda_rad = 0.01, 0.01
-            dir_loss = self.direction_diversity_loss(delta)
-            rad_loss = self.norm_based_epsilon_regularization_loss(delta) # hard margin 49.1
+
+            dir_loss = self.config.lambda_dir * self.direction_diversity_loss(delta, self.config.alpha)
+            norm_loss = self.config.lambda_epsilon * self.norm_based_epsilon_regularization_loss(delta, self.config.lambda_lower) # hard margin 49.1
 
 
-            t_anchor_reg_loss = lambda_dir * dir_loss + lambda_rad * rad_loss
-            kl_loss += t_anchor_reg_loss
+            t_anchor_reg_loss = dir_loss + norm_loss
+            reg_loss = vib_loss + t_anchor_reg_loss
             if self.config.local_rank==0 and global_step%50==0:
-                print(f't dir loss: {lambda_dir * dir_loss}, t rad loss: {lambda_rad * rad_loss}')
-                print(f'kl loss: {lamba * kl_div}')
+                print(f't dir loss: {dir_loss}, t norm loss: {norm_loss}')
+                print(f'kl loss: {vib_loss}')
 
-        return retrieve_logits, retrieve_logits.T, kl_loss, cls, delta, video_feat_pooled, gamma_row, gamma_column
+        return retrieve_logits, retrieve_logits.T, reg_loss, cls, delta, video_feat_pooled, gamma_row, gamma_column # (a,b,d)
 
 
-    def direction_diversity_loss(self, delta, t=2.0):
+    def direction_diversity_loss(self, delta, alpha=2.0):
         B_t, B_v, D = delta.shape
         delta_dir = F.normalize(delta, dim=2)
 
@@ -248,16 +247,16 @@ class GARE(nn.Module):
             z = delta_dir[i]
             sim = torch.matmul(z, z.T)
             dist = 1 - sim
-            loss += torch.log(torch.exp(-t * dist).mean() + 1e-8)
+            loss += torch.log(torch.exp(-alpha * dist).mean() + 1e-8)
 
         return loss / B_t
 
-    def norm_based_epsilon_regularization_loss(self, delta):
+    def norm_based_epsilon_regularization_loss(self, delta, lambda_lower):
         B_t, B_v, D = delta.shape
         dist = delta.norm(p=2, dim=2)
         var = dist.var(dim=1)
         loss = -var.mean()
-        return loss  if loss >= -0.5 else 0
+        return loss  if loss >= -lambda_lower else 0
 
 
 
