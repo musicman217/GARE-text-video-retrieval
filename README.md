@@ -61,12 +61,34 @@ main_retrieval.py \
 --video_framerate 1 \
 --output_dir ckpts/ckpt_msrvtt_retrieval_looseType \
 --temp 3 \
---alpha 2 \
---beta 0.07 \
+--alpha 2.0 \
+--beta 1e-4 \
 --lambda_dir 0.01 \
 --lambda_epsilon 0.01 \
 --lambda_lower 0.5
 ```
+
+### Note on KL Regularization
+
+In the paper, the KL regularization coefficient is reported as $\beta=0.07$. This value corresponds to our earlier implementation, where the Gaussian KL term was computed dimension-wise, i.e., each feature dimension was treated as an individual one-dimensional Gaussian.
+
+In the released code, we adopt the corrected probabilistic formulation by wrapping the diagonal Gaussian with `torch.distributions.Independent`, so that all feature dimensions are interpreted as one multivariate Gaussian event:
+
+```python
+dist = torch.distributions.Independent(
+    torch.distributions.Normal(mu, sigma), 1
+)
+```
+
+With this implementation, the KL divergence is computed as the KL of a diagonal multivariate Gaussian, where the embedding dimensions are accumulated as one event. Therefore, the numerical scale of the KL term is different from the earlier dimension-wise implementation.
+
+To keep the regularization strength appropriate and improve training stability, we use:
+
+```shell
+--beta 1e-4
+```
+
+This is the recommended setting for the released code. The difference between $\beta=0.07$ in the paper and `--beta 1e-4` in this repository only comes from the KL implementation convention, while the variational bottleneck objective remains consistent with the paper.
 
 ## 🎗️ Acknowledgments
 * This code implementation are adopted from [CLIP](https://github.com/openai/CLIP), [DRL](https://github.com/foolwood/DRL), and [EMCL](https://github.com/jpthu17/EMCL).
