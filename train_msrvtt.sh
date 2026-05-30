@@ -22,8 +22,8 @@ main_retrieval.py \
 --video_framerate 1 \
 --output_dir ckpts/ckpt_msrvtt_retrieval_looseType \
 --temp 3 \
---alpha 2 \
---beta 0.07 \
+--alpha 2.0 \
+--beta 1e-4 \
 --lambda_dir 0.01 \
 --lambda_epsilon 0.01 \
 --lambda_lower 0.5
