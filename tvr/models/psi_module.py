@@ -26,31 +26,25 @@ class MultiHeadedCrossAttn(nn.Module):
         self.v_proj = nn.Linear(dim,dim)
         self.out_proj = nn.Linear(dim,dim)
 #
-    def forward(self, q_embeds, context_embeds, attn_mask=None):
-
-        t, b, a, d = q_embeds.shape # actually, t=1
+    def forward(self, q_embeds, c_embeds):
+        t, b, a, d = q_embeds.shape
         q = self.q_proj(q_embeds)
         q = q.reshape(t, b, a, self.num_heads, self.head_dim) # (t,b,a,h,hd)
         q = q.permute(0,1,3,4,2) # (t,b,h,hd,a)
 
-        _, f, _, _ = context_embeds.shape
-        video_embeds = context_embeds.permute(0,2,1,3) # (t,b,f,d)
-        k = self.k_proj(video_embeds)
+        _, f, _, _ = c_embeds.shape
+        c_embeds = c_embeds.permute(0,2,1,3) # (t,b,f,d)
+        k = self.k_proj(c_embeds)
         k = k.reshape(t, b, f, self.num_heads, self.head_dim)
         k = k.permute(0,1,3,2,4) # (t,b,h,f,hd)
 
-        v = self.v_proj(video_embeds)
+        v = self.v_proj(c_embeds)
         v = v.reshape(t, b, f, self.num_heads, self.head_dim)
         v = v.permute(0,1,3,4,2) # (t,b,h,hd,f)
 
-        # (t,b,h,f,hd)x(t,b,h,hd,a)->(t,b,h,f,a)
-        # this is pair-wise parallelization
         attention_logits = k @ q
+        # (t,b,h,f,hd)x(t,b,h,hd,a)->(t,b,h,f,a)
         attention_logits = attention_logits / math.sqrt(self.head_dim)
-        if attn_mask is not None:
-            # attn_mask shape: (b,f), valid for 1, invalid for 0
-            attn_mask = attn_mask[None,:,None,:,None] # ->(1,b,1,f,1)
-            attention_logits = attention_logits.masked_fill(attn_mask == 0, -1e9)
         attention_weights = F.softmax(attention_logits, dim=-2)
 
         attention = v @ attention_weights
@@ -58,7 +52,6 @@ class MultiHeadedCrossAttn(nn.Module):
 
         attention = attention.permute(0,1,4,2,3)  # (t,b,a,h,hd)
         attention = attention.reshape(t, b, a, self.embed_dim)
-
         o = self.out_proj(attention)
         return o.permute(0,2,1,3), attention_weights # (a,b,d)
 
@@ -94,12 +87,13 @@ class Transformer(nn.Module):
                     param.data.fill_(0.)
 
     def forward(self, q_embeds, C_embeds):
+
         # pre norm
         q_embeds = self.layer_norm1(q_embeds)
         C_embeds = self.layer_norm1(C_embeds) # it's important to use the same layer norm
 
         attn_out,_ = self.cross_attn(q_embeds, C_embeds) # (a,b,d)
-        attn_out = self.layer_norm2(attn_out)
+        attn_out = self.layer_norm2(attn_out) 
 
         linear_out = self.linear1(attn_out)
         out = attn_out + self.dropout(linear_out)
@@ -121,14 +115,14 @@ class Psi(nn.Module):
 
     def forward(self, delta, C):
         t,a,b,d = delta.size()
-        delta = delta.permute(0,2,1,3) # (t,b,a,d)
-        C = C.permute(0,2,1,3)
+        delta = delta.permute(0,2,1,3) # (b,a,d)
+        C = C.permute(0,2,1,3) # [f,b,d]
 
         out = delta
         for layer in self.layers:
-            _out = layer(out, C) # ->(t,a,b,d)
-        mean = self.mean_proj(_out) # (t,a,b,d)
-        log_sigma = self.log_std_proj(_out) # (t,a,b,d)
+            _out = layer(out, C) # ->(a,b,d)
+        mean = self.mean_proj(_out) # (a,b,d)
+        log_sigma = self.log_std_proj(_out) # (a,b,d)
         return mean, log_sigma
 
 
