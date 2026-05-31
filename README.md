@@ -2,7 +2,7 @@
   
 # 【NeurIPS'2025】Rebalancing Contrastive Alignment with Bottlenecked Semantic Increments in Text-Video Retrieval
 [![Conference](https://img.shields.io/badge/NeurIPS-2025-ff69b4.svg)](https://nips.cc/Conferences/2025)
-[![Paper](http://img.shields.io/badge/Paper-arxiv.2505.12499-FF6B6B.svg)](https://arxiv.org/abs/2505.12499)
+[![Paper](https://img.shields.io/badge/Paper-NeurIPS%202025-0071BC.svg)]([https://arxiv.org/abs/2505.12499](https://proceedings.neurips.cc/paper_files/paper/2025/file/045da2b279b3efaf344d488c7da2aba6-Paper-Conference.pdf))
 </div>
 
 ## 📚 Abstract
